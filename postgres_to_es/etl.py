@@ -300,7 +300,7 @@ if __name__ == '__main__':
               elastic_url=config('ELASTIC_URL'),
               index_name=config('ELASTIC_INDEX_NAME')
               )
+    logging.info("Let's go")
     load_process = etl.load()
     transform_process = etl.transform(load_process)
     extract_process = etl.extract(target=transform_process)
-    logging.info("")
