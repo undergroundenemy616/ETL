@@ -1,7 +1,5 @@
-import abc
 import json
 import logging
-from functools import wraps
 from time import sleep
 from typing import Any
 from urllib.parse import urljoin
@@ -11,57 +9,11 @@ import redis
 import requests
 from decouple import config
 from psycopg2.extras import RealDictCursor
-from redis import Redis
+
+from state_storage import RedisStorage
+from utils import backoff, coroutine
 
 logging.basicConfig(level=logging.INFO)
-
-
-def backoff(start_sleep_time=0.1, factor=2, border_sleep_time=10):
-    def func_wrapper(func):
-        @wraps(func)
-        def inner(*args, **kwargs):
-            t = 0
-            while True:
-                try:
-                    return func(*args, **kwargs)
-                except Exception as ex:
-                    print(ex)
-                    t += start_sleep_time * 2**(factor) if t < border_sleep_time else border_sleep_time
-                    sleep(t)
-        return inner
-    return func_wrapper
-
-
-def coroutine(func):
-    @wraps(func)
-    def inner(*args, **kwargs):
-        fn = func(*args, **kwargs)
-        next(fn)
-        return fn
-    return inner
-
-
-class BaseStorage:
-    @abc.abstractmethod
-    def save_state(self, key: str, value: str) -> None:
-        pass
-
-    @abc.abstractmethod
-    def retrieve_state(self, key: str) -> dict:
-        pass
-
-
-class RedisStorage(BaseStorage):
-    def __init__(self, redis_adapter: Redis):
-        self.redis_adapter = redis_adapter
-        self.states = ['filmwork', 'genre', 'person']
-
-    def save_state(self, key: str, value: str) -> None:
-        self.redis_adapter.set(key, value)
-
-    def retrieve_state(self, key) -> dict:
-        value = self.redis_adapter.get(key)
-        return value if not value else value.decode("UTF-8")
 
 
 class ETL:
