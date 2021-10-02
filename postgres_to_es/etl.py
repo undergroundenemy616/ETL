@@ -30,6 +30,9 @@ class ETL:
         self.elastic_url = elastic_url
 
     def __get_sql_for_m2m_person(self, table_name: str) -> str:
+        """
+        Получаем имена и id всех персон конкретного типа (актер, директор, режиссер) для FilmWork.
+        """
         with_name = table_name.split('_')[2]
         as_name = ''.join([word[0] for word in table_name.split('_')])
         SQL = f'''
@@ -46,6 +49,9 @@ class ETL:
         return SQL
 
     def __get_es_bulk_query(self, rows: list[dict]) -> list[str]:
+        """
+        Создаем список для записи в ES.
+        """
         prepared_query = []
         for row in rows:
             prepared_query.extend([
@@ -55,6 +61,9 @@ class ETL:
         return prepared_query
 
     def __get_updated_table_ids_sql(self, updated_at: str, state_name: str) -> str:
+        """
+        Получаем обновленные объекты из привязанных таблиц (genre, person).
+        """
         SQL = f'''
         SELECT id,
                updated_at 
@@ -66,6 +75,9 @@ class ETL:
         return SQL
 
     def __get_updated_filmworks_ids_by_state_name(self, ids: str, state_name: str) -> str:
+        """
+        Получаем id FilmWork, которые будут обновлены за счет обновлений конкретной привязнной таблицы (genre, person).
+        """
         if state_name == 'person':
             SQL = f'''
             SELECT fm.id,
@@ -91,6 +103,9 @@ class ETL:
         return SQL
 
     def __get_updated_filmworks_by_ids_sql(self, filmworks_ids: str) -> str:
+        """
+        Получаем обновленные FilmWork по спсику их id.
+        """
         SQL = f'''
         {self.__get_base_filmwork_sql()}
         WHERE fm.id in ({filmworks_ids})
@@ -98,6 +113,9 @@ class ETL:
         return SQL
 
     def __get_updated_filmworks_sql(self, updated_at: str) -> str:
+        """
+        Получаем обновленные FilmWork по полю updated_at.
+        """
         SQL = f'''
         {self.__get_base_filmwork_sql()}
         WHERE fm.updated_at > '{updated_at}'
@@ -107,6 +125,9 @@ class ETL:
         return SQL
 
     def __get_base_filmwork_sql(self) -> str:
+        """
+        Базовый запрос для получения объектов FilmWork.
+        """
         with_actors_sql = self.__get_sql_for_m2m_person('movies_filmwork_actors')
         with_writers_sql = self.__get_sql_for_m2m_person('movies_filmwork_writers')
         with_directors_sql = self.__get_sql_for_m2m_person('movies_filmwork_directors')
@@ -165,6 +186,12 @@ class ETL:
                 logging.error(error_message)
 
     def get_updated_table_data(self, state_name: str) -> list[list, str]:
+        """
+        Получаем обновленные фильмы по названию таблицы. Если state_name = filmwork, то просто делаем запрос на
+        получение всех фильмов по последнему состоянию updated_at этой таблицы. Если state_name in [preson, genre],
+        то сначала получим все обновленные объкты этих таблицы по состоянию updated_at, а  потом возьмем все FilmWork,
+        в которых встречаются эти обновленные объекты.
+        """
         pg_conn = self.get_db_connection()
         postgres_cur = pg_conn.cursor()
         state = self.redis_storage.retrieve_state(state_name)
