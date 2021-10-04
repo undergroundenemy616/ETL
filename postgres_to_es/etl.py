@@ -17,18 +17,18 @@ from utils import coroutine
 logging.basicConfig(level=logging.INFO)
 
 
-class ETL:
+class FilmWorkAdapter:
     def __init__(self, dsn: dict,
-                 redis_storage: Any,
-                 chunk_size: int,
-                 index_name: str,
-                 elastic_url: str):
+                 chunk_size: int):
 
         self.dsn = dsn
         self.chunk_size = chunk_size
-        self.redis_storage = redis_storage
-        self.index_name = index_name
-        self.elastic_url = elastic_url
+
+    @backoff.on_exception(backoff.expo, psycopg2.OperationalError)
+    def get_db_connection(self):
+        dsn_string = ' '.join([f'{key}={value}' for key, value in self.dsn.items()])
+        pg_conn = psycopg2.connect(dsn=dsn_string, cursor_factory=RealDictCursor)
+        return pg_conn
 
     @staticmethod
     def get_sql_for_m2m_person(table_name: str) -> str:
@@ -50,19 +50,7 @@ class ETL:
         '''
         return SQL
 
-    def __get_es_bulk_query(self, rows: list[dict]) -> list[str]:
-        """
-        Создаем список для записи в ES.
-        """
-        prepared_query = []
-        for row in rows:
-            prepared_query.extend([
-                json.dumps({'index': {'_index': self.index_name, '_id': row['id']}}),
-                json.dumps(row)
-            ])
-        return prepared_query
-
-    def __get_updated_table_ids_sql(self, updated_at: str, state_name: str) -> str:
+    def get_updated_table_ids_sql(self, updated_at: str, state_name: str) -> str:
         """
         Получаем обновленные объекты из привязанных таблиц (genre, person).
         """
@@ -105,7 +93,7 @@ class ETL:
             '''
         return SQL
 
-    def __get_updated_filmworks_by_ids_sql(self, filmworks_ids: str) -> str:
+    def get_updated_filmworks_by_ids_sql(self, filmworks_ids: str) -> str:
         """
         Получаем обновленные FilmWork по спсику их id.
         """
@@ -115,7 +103,7 @@ class ETL:
         '''
         return SQL
 
-    def __get_updated_filmworks_sql(self, updated_at: str) -> str:
+    def get_updated_filmworks_sql(self, updated_at: str) -> str:
         """
         Получаем обновленные FilmWork по полю updated_at.
         """
@@ -167,11 +155,30 @@ class ETL:
         '''
         return SQL
 
-    @backoff.on_exception(backoff.expo, psycopg2.OperationalError)
-    def get_db_connection(self):
-        dsn_string = ' '.join([f'{key}={value}' for key, value in self.dsn.items()])
-        pg_conn = psycopg2.connect(dsn=dsn_string, cursor_factory=RealDictCursor)
-        return pg_conn
+
+class ETL:
+    def __init__(self,
+                 redis_storage: Any,
+                 filmwork_adapter: Any,
+                 index_name: str,
+                 elastic_url: str):
+
+        self.filmwork_adapter = filmwork_adapter
+        self.redis_storage = redis_storage
+        self.index_name = index_name
+        self.elastic_url = elastic_url
+
+    def __get_es_bulk_query(self, rows: list[dict]) -> list[str]:
+        """
+        Создаем список для записи в ES.
+        """
+        prepared_query = []
+        for row in rows:
+            prepared_query.extend([
+                json.dumps({'index': {'_index': self.index_name, '_id': row['id']}}),
+                json.dumps(row)
+            ])
+        return prepared_query
 
     @backoff.on_exception(backoff.expo,
                           (requests.exceptions.ConnectionError,
@@ -197,25 +204,25 @@ class ETL:
         то сначала получим все обновленные объкты этих таблицы по состоянию updated_at, а  потом возьмем все FilmWork,
         в которых встречаются эти обновленные объекты.
         """
-        pg_conn = self.get_db_connection()
+        pg_conn = self.filmwork_adapter.get_db_connection()
         try:
             postgres_cur = pg_conn.cursor()
             state = self.redis_storage.retrieve_state(state_name)
             state = state if state else config('DEFAULT_UPDATED_AT_STATE')
             if state_name != self.redis_storage.states[0]:
-                postgres_cur.execute(self.__get_updated_table_ids_sql(state, state_name))
+                postgres_cur.execute(self.filmwork_adapter.get_updated_table_ids_sql(state, state_name))
             else:
-                postgres_cur.execute(self.__get_updated_filmworks_sql(state))
+                postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_sql(state))
             data = postgres_cur.fetchall()
             updated_state_value = None
             if data:
                 updated_state_value = data[-1]['updated_at']
                 if state_name != self.redis_storage.states[0]:
                     ids = ','.join([f"'{row['id']}'" for row in data])
-                    postgres_cur.execute(self.get_updated_filmworks_ids_by_state_name(ids, state_name))
+                    postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_ids_by_state_name(ids, state_name))
                     updated_filmworks_ids_data = postgres_cur.fetchall()
                     updated_filmworkds_ids = ','.join([f"'{filmwork['id']}'" for filmwork in updated_filmworks_ids_data])
-                    postgres_cur.execute(self.__get_updated_filmworks_by_ids_sql(updated_filmworkds_ids))
+                    postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_by_ids_sql(updated_filmworkds_ids))
                     data = postgres_cur.fetchall()
         finally:
             pg_conn.close()
@@ -283,9 +290,10 @@ if __name__ == '__main__':
 
     r = redis.Redis(host=config('REDIS_HOST'), port=config('REDIS_PORT'))
     input_redis_storage = RedisStorage(redis_adapter=r)
-    etl = ETL(dsn=input_dsn,
+    input_filmwork_adapter = FilmWorkAdapter(dsn=input_dsn,
+                                        chunk_size=config('CHUNK_SIZE'))
+    etl = ETL(filmwork_adapter=input_filmwork_adapter,
               redis_storage=input_redis_storage,
-              chunk_size=config('CHUNK_SIZE'),
               elastic_url=config('ELASTIC_URL'),
               index_name=config('ELASTIC_INDEX_NAME')
               )
