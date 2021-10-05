@@ -11,9 +11,9 @@ import redis
 import requests
 from decouple import config
 
+from filmwork_adapter import FilmWorkAdapter
 from state_storage import RedisStorage
 from utils import coroutine
-from filmwork_adapter import FilmWorkAdapter
 
 logging.basicConfig(level=logging.INFO)
 
