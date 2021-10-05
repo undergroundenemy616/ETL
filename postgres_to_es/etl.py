@@ -1,5 +1,6 @@
 import json
 import logging
+from collections import namedtuple
 from time import sleep
 from typing import Any
 from urllib.parse import urljoin
@@ -9,154 +10,17 @@ import psycopg2
 import redis
 import requests
 from decouple import config
-from psycopg2.extras import RealDictCursor
 
 from state_storage import RedisStorage
 from utils import coroutine
+from filmwork_adapter import FilmWorkAdapter
 
 logging.basicConfig(level=logging.INFO)
 
 
-class FilmWorkAdapter:
-    def __init__(self, dsn: dict,
-                 chunk_size: int):
-
-        self.dsn = dsn
-        self.chunk_size = chunk_size
-
-    @backoff.on_exception(backoff.expo, psycopg2.OperationalError)
-    def get_db_connection(self):
-        dsn_string = ' '.join([f'{key}={value}' for key, value in self.dsn.items()])
-        pg_conn = psycopg2.connect(dsn=dsn_string, cursor_factory=RealDictCursor)
-        return pg_conn
-
-    @staticmethod
-    def get_sql_for_m2m_person(table_name: str) -> str:
-        """
-        Получаем имена и id всех персон конкретного типа (актер, директор, режиссер) для FilmWork.
-        """
-        with_name = table_name.split('_')[2]
-        as_name = ''.join([word[0] for word in table_name.split('_')])
-        SQL = f'''
-        {with_name} as (
-        SELECT m.id, 
-               string_agg(CAST(a.id AS TEXT), ',') ids,
-               string_agg(a.first_name || ' ' || a.last_name, ',') persons_names
-        FROM movies_filmwork m
-            LEFT JOIN {table_name} {as_name} on m.id = {as_name}.filmwork_id 
-            LEFT JOIN movies_person a on {as_name}.person_id = a.id
-        GROUP BY m.id
-        )
-        '''
-        return SQL
-
-    def get_updated_table_ids_sql(self, updated_at: str, state_name: str) -> str:
-        """
-        Получаем обновленные объекты из привязанных таблиц (genre, person).
-        """
-        SQL = f'''
-        SELECT id,
-               updated_at 
-        FROM movies_{state_name} 
-        WHERE updated_at > '{updated_at}'
-        ORDER BY updated_at
-        LIMIT {self.chunk_size}
-        '''
-        return SQL
-
-    @staticmethod
-    def get_updated_filmworks_ids_by_state_name(ids: str, state_name: str) -> str:
-        """
-        Получаем id FilmWork, которые будут обновлены за счет обновлений конкретной привязнной таблицы (genre, person).
-        """
-        if state_name == 'person':
-            SQL = f'''
-            SELECT fm.id,
-                   fm.updated_at
-            FROM movies_filmwork fm
-                LEFT JOIN movies_filmwork_actors a ON a.filmwork_id = fm.id
-                LEFT JOIN movies_filmwork_writers w ON w.filmwork_id = fm.id
-                LEFT JOIN movies_filmwork_directors d ON d.filmwork_id = fm.id
-            WHERE a.person_id IN ({ids}) OR 
-                  w.person_id IN ({ids}) OR 
-                  d.person_id in ({ids})
-            ORDER BY fm.updated_at
-            '''
-        else:
-            SQL = f'''
-            SELECT fm.id,
-                   fm.updated_at
-            FROM movies_filmwork fm
-                LEFT JOIN movies_filmwork_genres g ON g.filmwork_id = fm.id
-            WHERE g.genre_id IN ({ids})
-            ORDER BY fm.updated_at
-            '''
-        return SQL
-
-    def get_updated_filmworks_by_ids_sql(self, filmworks_ids: str) -> str:
-        """
-        Получаем обновленные FilmWork по спсику их id.
-        """
-        SQL = f'''
-        {self.__get_base_filmwork_sql()}
-        WHERE fm.id in ({filmworks_ids})
-        '''
-        return SQL
-
-    def get_updated_filmworks_sql(self, updated_at: str) -> str:
-        """
-        Получаем обновленные FilmWork по полю updated_at.
-        """
-        SQL = f'''
-        {self.__get_base_filmwork_sql()}
-        WHERE fm.updated_at > '{updated_at}'
-        ORDER BY fm.updated_at
-        LIMIT {self.chunk_size}
-        '''
-        return SQL
-
-    def __get_base_filmwork_sql(self) -> str:
-        """
-        Базовый запрос для получения объектов FilmWork.
-        """
-        with_actors_sql = self.get_sql_for_m2m_person('movies_filmwork_actors')
-        with_writers_sql = self.get_sql_for_m2m_person('movies_filmwork_writers')
-        with_directors_sql = self.get_sql_for_m2m_person('movies_filmwork_directors')
-        SQL = f'''
-        WITH genres as (
-            SELECT m.id, 
-                   string_agg(g.title, ',') titles
-            FROM movies_filmwork m
-                LEFT JOIN movies_filmwork_genres mfg on m.id = mfg.filmwork_id 
-                LEFT JOIN movies_genre g on mfg.genre_id = g.id
-            GROUP BY m.id
-        ),
-        {with_actors_sql},
-        {with_directors_sql},
-        {with_writers_sql}
-
-        SELECT 
-               fm.updated_at,
-               fm.id,
-               fm.rating,
-               genres.titles genres_titles,
-               fm.title,
-               fm.description,
-               actors.ids actors_ids,
-               actors.persons_names actors_names,
-               writers.ids writers_ids,
-               writers.persons_names writers_names,
-               directors.persons_names directors_names
-        FROM movies_filmwork fm
-            LEFT JOIN genres ON genres.id = fm.id
-            LEFT JOIN actors ON actors.id = fm.id
-            LEFT JOIN writers ON writers.id = fm.id
-            LEFT JOIN directors ON directors.id = fm.id
-        '''
-        return SQL
-
-
 class ETL:
+    UpdatedFilmworks = namedtuple('UpdatedFilmworksData', 'data state_name updated_state_value')
+
     def __init__(self,
                  redis_storage: Any,
                  filmwork_adapter: Any,
@@ -197,7 +61,8 @@ class ETL:
             if error_message:
                 logging.error(error_message)
 
-    def get_updated_table_data(self, state_name: str) -> list[list, str, str]:
+    @backoff.on_exception(backoff.expo, psycopg2.OperationalError)
+    def get_updated_table_data(self, state_name: str) -> UpdatedFilmworks:
         """
         Получаем обновленные фильмы по названию таблицы. Если state_name = filmwork, то просто делаем запрос на
         получение всех фильмов по последнему состоянию updated_at этой таблицы. Если state_name in [preson, genre],
@@ -226,7 +91,10 @@ class ETL:
                     data = postgres_cur.fetchall()
         finally:
             pg_conn.close()
-        return [data, state_name, updated_state_value]
+        updated_filmworks = self.UpdatedFilmworks(data=data,
+                                                  state_name=state_name,
+                                                  updated_state_value=updated_state_value)
+        return updated_filmworks
 
     @coroutine
     def extract(self, target):
@@ -235,17 +103,17 @@ class ETL:
             updated_filmworks = [self.get_updated_table_data(self.redis_storage.states[2]),
                                  self.get_updated_table_data(self.redis_storage.states[1]),
                                  self.get_updated_table_data(self.redis_storage.states[0])]
-            for data in updated_filmworks:
-                if data[0]:
-                    target.send(data)
-                    logging.info(f'Found {len(data[0])} updated filmworks of table {data[1]}')
+            for updated_table_filmworks in updated_filmworks:
+                if updated_table_filmworks.data:
+                    target.send(updated_table_filmworks)
+                    logging.info(f'Found {len(updated_table_filmworks.data)} updated filmworks of table {updated_table_filmworks.state_name}')
 
     @coroutine
     def transform(self, target):
         while True:
-            updated_data = (yield)
+            updated_table_filmwork = (yield)
             index_film_data = []
-            for film in updated_data[0]:
+            for film in updated_table_filmwork.data:
                 genres = film['genres_titles'].split(',')
                 actors = [
                     {'id': _id, 'name': name}
@@ -268,16 +136,20 @@ class ETL:
                     'writers': writers
                 }
                 index_film_data.append(index_film)
-            target.send([index_film_data, updated_data[1], updated_data[2]])
+            transformed_filmworks = self.UpdatedFilmworks(data=index_film_data,
+                                                          state_name=updated_table_filmwork.state_name,
+                                                          updated_state_value=updated_table_filmwork.updated_state_value)
+            target.send(transformed_filmworks)
 
     @coroutine
     def load(self):
         while True:
-            updated_data = (yield)
-            self.__load_to_es(updated_data[0])
-            if updated_data[2]:
-                self.redis_storage.save_state(updated_data[1], str(updated_data[2]))
-            logging.info(f"{len(updated_data[0])} filmworks loaded to Elastic index")
+            transformed_filmworks = (yield)
+            self.__load_to_es(transformed_filmworks.data)
+            if transformed_filmworks.data:
+                self.redis_storage.save_state(transformed_filmworks.state_name,
+                                              str(transformed_filmworks.updated_state_value))
+            logging.info(f"{len(transformed_filmworks.data)} filmworks loaded to Elastic index")
 
 
 if __name__ == '__main__':
@@ -291,7 +163,7 @@ if __name__ == '__main__':
     r = redis.Redis(host=config('REDIS_HOST'), port=config('REDIS_PORT'))
     input_redis_storage = RedisStorage(redis_adapter=r)
     input_filmwork_adapter = FilmWorkAdapter(dsn=input_dsn,
-                                        chunk_size=config('CHUNK_SIZE'))
+                                             chunk_size=config('CHUNK_SIZE'))
     etl = ETL(filmwork_adapter=input_filmwork_adapter,
               redis_storage=input_redis_storage,
               elastic_url=config('ELASTIC_URL'),
