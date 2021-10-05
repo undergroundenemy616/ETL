@@ -106,7 +106,9 @@ class ETL:
             for updated_table_filmworks in updated_filmworks:
                 if updated_table_filmworks.data:
                     target.send(updated_table_filmworks)
-                    logging.info(f'Found {len(updated_table_filmworks.data)} updated filmworks of table {updated_table_filmworks.state_name}')
+                    logging.info("Found %d updated filmworks of table %s",
+                                 len(updated_table_filmworks.data),
+                                 updated_table_filmworks.state_name)
 
     @coroutine
     def transform(self, target):
@@ -149,7 +151,7 @@ class ETL:
             if transformed_filmworks.data:
                 self.redis_storage.save_state(transformed_filmworks.state_name,
                                               str(transformed_filmworks.updated_state_value))
-            logging.info(f"{len(transformed_filmworks.data)} filmworks loaded to Elastic index")
+            logging.info("%d filmworks loaded to Elastic index", len(transformed_filmworks.data))
 
 
 if __name__ == '__main__':
