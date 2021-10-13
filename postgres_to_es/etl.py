@@ -19,7 +19,10 @@ logging.basicConfig(level=logging.INFO)
 
 
 class ETL:
-    UpdatedFilmworks = namedtuple('UpdatedFilmworksData', 'data state_name updated_state_value')
+    UpdatedFilmworks = namedtuple('UpdatedFilmworksData', 'updated_table_data '
+                                                          'updated_related_filmworks '
+                                                          'state_name '
+                                                          'updated_state_value')
 
     def __init__(self,
                  redis_storage: Any,
@@ -32,14 +35,14 @@ class ETL:
         self.index_name = index_name
         self.elastic_url = elastic_url
 
-    def __get_es_bulk_query(self, rows: list[dict]) -> list[str]:
+    def __get_es_bulk_query(self, rows: list[dict], index: str) -> list[str]:
         """
         Создаем список для записи в ES.
         """
         prepared_query = []
         for row in rows:
             prepared_query.extend([
-                json.dumps({'index': {'_index': self.index_name, '_id': row['id']}}),
+                json.dumps({'index': {'_index': index, '_id': row['id']}}),
                 json.dumps(row)
             ])
         return prepared_query
@@ -47,8 +50,8 @@ class ETL:
     @backoff.on_exception(backoff.expo,
                           (requests.exceptions.ConnectionError,
                            requests.exceptions.Timeout))
-    def __load_to_es(self, records: list[dict]) -> None:
-        prepared_query = self.__get_es_bulk_query(records)
+    def __load_to_es(self, records: list[dict], index: str) -> None:
+        prepared_query = self.__get_es_bulk_query(records, index)
         str_query = '\n'.join(prepared_query) + '\n'
         response = requests.post(
             urljoin(self.elastic_url, '_bulk'),
@@ -75,11 +78,12 @@ class ETL:
             state = self.redis_storage.retrieve_state(state_name)
             state = state if state else config('DEFAULT_UPDATED_AT_STATE')
             if state_name != self.redis_storage.states[0]:
-                postgres_cur.execute(self.filmwork_adapter.get_updated_table_ids_sql(state, state_name))
+                postgres_cur.execute(self.filmwork_adapter.get_updated_table_sql(state, state_name))
             else:
                 postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_sql(state))
             data = postgres_cur.fetchall()
             updated_state_value = None
+            updated_related_filmworks = None
             if data:
                 updated_state_value = data[-1]['updated_at']
                 if state_name != self.redis_storage.states[0]:
@@ -88,10 +92,11 @@ class ETL:
                     updated_filmworks_ids_data = postgres_cur.fetchall()
                     updated_filmworkds_ids = ','.join([f"'{filmwork['id']}'" for filmwork in updated_filmworks_ids_data])
                     postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_by_ids_sql(updated_filmworkds_ids))
-                    data = postgres_cur.fetchall()
+                    updated_related_filmworks = postgres_cur.fetchall()
         finally:
             pg_conn.close()
-        updated_filmworks = self.UpdatedFilmworks(data=data,
+        updated_filmworks = self.UpdatedFilmworks(updated_table_data=data,
+                                                  updated_related_filmworks=updated_related_filmworks,
                                                   state_name=state_name,
                                                   updated_state_value=updated_state_value)
         return updated_filmworks
@@ -104,54 +109,107 @@ class ETL:
                                  self.get_updated_table_data(self.redis_storage.states[1]),
                                  self.get_updated_table_data(self.redis_storage.states[0])]
             for updated_table_filmworks in updated_filmworks:
-                if updated_table_filmworks.data:
+                if updated_table_filmworks.updated_table_data:
                     target.send(updated_table_filmworks)
                     logging.info("Found %d updated filmworks of table %s",
-                                 len(updated_table_filmworks.data),
+                                 len(updated_table_filmworks.updated_table_data),
                                  updated_table_filmworks.state_name)
+
+    @staticmethod
+    def transform_filmworks(filmworks: list) -> list:
+        index_film_data = []
+        for film in filmworks:
+            actors = [
+                {'id': _id, 'name': name}
+                for _id, name in zip(film['actors_ids'].split(','), film['actors_names'].split(','))
+            ]
+            writers = [
+                {'id': _id, 'name': name}
+                for _id, name in zip(film['writers_ids'].split(','), film['writers_names'].split(','))
+            ]
+            genres = [
+                {'id': _id, 'name': name}
+                for _id, name in zip(film['genres_ids'].split(','), film['genres_titles'].split(','))
+            ]
+            index_film = {
+                'id': film['id'],
+                'genres': genres,
+                'imdb_rating': float(film['rating']),
+                'title': film['title'],
+                'description': film['description'],
+                'directors': film['directors_names'].split(','),
+                'actors_names': film['actors_names'].split(','),
+                'writers_names': film['writers_names'].split(','),
+                'actors': actors,
+                'writers': writers
+            }
+            index_film_data.append(index_film)
+        return index_film_data
+
+    @staticmethod
+    def transform_genres(genres: list) -> list:
+        index_genre_data = []
+        for genre in genres:
+            index_genre = {
+                'id': genre['id'],
+                'name': genre['title'],
+                'description': genre['description']
+            }
+            index_genre_data.append(index_genre)
+        return index_genre_data
+
+    @staticmethod
+    def transform_persons(persons: list) -> list:
+        index_person_data = []
+        for person in persons:
+            films_participated = []
+            if person['films_as_actor']:
+                films_participated.append(person['films_as_actor'].split(','))
+            if person['films_as_writer']:
+                films_participated.append(person['films_as_writer'].split(','))
+            if person['films_as_director']:
+                films_participated.append(person['films_as_director'].split(','))
+            unique_film_ids = list(set().union(*films_participated))
+            index_person = {
+                'id': person['id'],
+                'full_name': person['full_name'],
+                'roles': person['roles'].split(','),
+                'film_ids': unique_film_ids
+            }
+            index_person_data.append(index_person)
+        return index_person_data
 
     @coroutine
     def transform(self, target):
         while True:
             updated_table_filmwork = (yield)
-            index_film_data = []
-            for film in updated_table_filmwork.data:
-                genres = film['genres_titles'].split(',')
-                actors = [
-                    {'id': _id, 'name': name}
-                    for _id, name in zip(film['actors_ids'].split(','), film['actors_names'].split(','))
-                ]
-                writers = [
-                    {'id': _id, 'name': name}
-                    for _id, name in zip(film['writers_ids'].split(','), film['writers_names'].split(','))
-                ]
-                index_film = {
-                    'id': film['id'],
-                    'genres': genres,
-                    'imdb_rating': float(film['rating']),
-                    'title': film['title'],
-                    'description': film['description'],
-                    'directors': film['directors_names'].split(','),
-                    'actors_names': film['actors_names'].split(','),
-                    'writers_names': film['writers_names'].split(','),
-                    'actors': actors,
-                    'writers': writers
-                }
-                index_film_data.append(index_film)
-            transformed_filmworks = self.UpdatedFilmworks(data=index_film_data,
-                                                          state_name=updated_table_filmwork.state_name,
-                                                          updated_state_value=updated_table_filmwork.updated_state_value)
-            target.send(transformed_filmworks)
+            updated_related_table = None
+            if updated_table_filmwork.state_name == self.redis_storage.states[0]:
+                transformed_data = self.transform_filmworks(updated_table_filmwork.updated_table_data)
+            elif updated_table_filmwork.state_name == self.redis_storage.states[1]:
+                transformed_data = self.transform_genres(updated_table_filmwork.updated_table_data)
+                updated_related_table = self.transform_filmworks(updated_table_filmwork.updated_related_filmworks)
+            else:
+                transformed_data = self.transform_persons(updated_table_filmwork.updated_table_data)
+                updated_related_table = self.transform_filmworks(updated_table_filmwork.updated_related_filmworks)
+
+            transformed_objects = self.UpdatedFilmworks(updated_table_data=transformed_data,
+                                                        updated_related_filmworks=updated_related_table,
+                                                        state_name=updated_table_filmwork.state_name,
+                                                        updated_state_value=updated_table_filmwork.updated_state_value)
+            target.send(transformed_objects)
 
     @coroutine
     def load(self):
         while True:
             transformed_filmworks = (yield)
-            self.__load_to_es(transformed_filmworks.data)
-            if transformed_filmworks.data:
+            self.__load_to_es(transformed_filmworks.updated_table_data, transformed_filmworks.state_name)
+            if transformed_filmworks.state_name in [self.redis_storage.states[1], self.redis_storage.states[2]]:
+                self.__load_to_es(transformed_filmworks.updated_related_filmworks, self.redis_storage.states[0])
+            if transformed_filmworks.updated_table_data:
                 self.redis_storage.save_state(transformed_filmworks.state_name,
                                               str(transformed_filmworks.updated_state_value))
-            logging.info("%d filmworks loaded to Elastic index", len(transformed_filmworks.data))
+            logging.info("%d filmworks loaded to Elastic index", len(transformed_filmworks.updated_table_data))
 
 
 if __name__ == '__main__':
