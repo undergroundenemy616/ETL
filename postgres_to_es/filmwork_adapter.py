@@ -36,18 +36,69 @@ class FilmWorkAdapter:
         '''
         return SQL
 
-    def get_updated_table_ids_sql(self, updated_at: str, state_name: str) -> str:
+    @staticmethod
+    def get_sql_for_m2m_role(table_name: str) -> str:
+        with_name = table_name.split('_')[2]
+        as_name = ''.join([word[0] for word in table_name.split('_')])
+        SQL = f'''
+        {with_name} as (
+        SELECT p.id,
+               string_agg(CAST({as_name}.filmwork_id AS TEXT), ',') ids
+        FROM movies_person p
+            LEFT JOIN {table_name} {as_name} on {as_name}.person_id = p.id
+        GROUP BY p.id
+        )
+        '''
+        return SQL
+
+    def get_updated_table_sql(self, updated_at: str, state_name: str) -> str:
         """
         Получаем обновленные объекты из привязанных таблиц (genre, person).
         """
-        SQL = f'''
-        SELECT id,
-               updated_at 
-        FROM movies_{state_name} 
-        WHERE updated_at > '{updated_at}'
-        ORDER BY updated_at
-        LIMIT {self.chunk_size}
-        '''
+        if state_name == 'genre':
+            SQL = f'''
+            SELECT *
+            FROM movies_{state_name} 
+            WHERE updated_at > '{updated_at}'
+            ORDER BY updated_at
+            LIMIT {self.chunk_size}
+            '''
+        else:
+            with_actors_films_sql = self.get_sql_for_m2m_role('movies_filmwork_actors')
+            with_writers_films_sql = self.get_sql_for_m2m_role('movies_filmwork_writers')
+            with_directors_films_sql = self.get_sql_for_m2m_role('movies_filmwork_directors')
+
+            SQL = f'''
+        WITH roles as (
+            SELECT p.id, 
+                   string_agg(r.title, ',') roles
+            FROM movies_person p
+                LEFT JOIN movies_person_roles pr on p.id = pr.person_id 
+                LEFT JOIN movies_role r on r.id = pr.role_id
+            GROUP BY p.id
+        ),
+        {with_actors_films_sql},
+        {with_writers_films_sql},
+        {with_directors_films_sql}
+        
+            SELECT p.id,
+                   p.updated_at,
+                   p.first_name || ' ' || p.last_name full_name,
+                   roles.roles roles,
+                   actors.ids films_as_actor,
+                   writers.ids films_as_writer,
+                   directors.ids films_as_director
+                
+            FROM movies_{state_name} p
+                LEFT JOIN roles ON roles.id = p.id
+                LEFT JOIN actors ON actors.id = p.id
+                LEFT JOIN writers ON writers.id = p.id
+                LEFT JOIN directors ON directors.id = p.id
+                
+            WHERE updated_at > '{updated_at}'
+            ORDER BY updated_at
+            LIMIT {self.chunk_size}
+            '''
         return SQL
 
     @staticmethod
@@ -111,6 +162,7 @@ class FilmWorkAdapter:
         SQL = f'''
         WITH genres as (
             SELECT m.id, 
+                   string_agg(CAST(g.id AS TEXT), ',') ids,
                    string_agg(g.title, ',') titles
             FROM movies_filmwork m
                 LEFT JOIN movies_filmwork_genres mfg on m.id = mfg.filmwork_id 
@@ -125,6 +177,7 @@ class FilmWorkAdapter:
                fm.updated_at,
                fm.id,
                fm.rating,
+               genres.ids genres_ids,
                genres.titles genres_titles,
                fm.title,
                fm.description,
