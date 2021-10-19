@@ -16,7 +16,6 @@ class BaseStorage:
 class RedisStorage(BaseStorage):
     def __init__(self, redis_adapter: Redis):
         self.redis_adapter = redis_adapter
-        self.states = ['filmwork', 'genre', 'person']
 
     def save_state(self, key: str, value: str) -> None:
         self.redis_adapter.set(key, value)
