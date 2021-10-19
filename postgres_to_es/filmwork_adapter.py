@@ -84,6 +84,7 @@ class FilmWorkAdapter:
             SELECT p.id,
                    p.updated_at,
                    p.first_name || ' ' || p.last_name full_name,
+                   p.birth_day birth,
                    roles.roles roles,
                    actors.ids films_as_actor,
                    writers.ids films_as_writer,
@@ -177,6 +178,7 @@ class FilmWorkAdapter:
                fm.updated_at,
                fm.id,
                fm.rating,
+               fm.type,
                genres.ids genres_ids,
                genres.titles genres_titles,
                fm.title,
@@ -185,6 +187,7 @@ class FilmWorkAdapter:
                actors.persons_names actors_names,
                writers.ids writers_ids,
                writers.persons_names writers_names,
+               directors.ids directors_ids,
                directors.persons_names directors_names
         FROM movies_filmwork fm
             LEFT JOIN genres ON genres.id = fm.id

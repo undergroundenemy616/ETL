@@ -55,6 +55,9 @@
       },
       "film_ids": {
         "type": "keyword"
+      },
+      "birth_day": {
+        "type": "text"
       }
     }
   }
