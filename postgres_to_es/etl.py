@@ -77,22 +77,23 @@ class ETL:
             postgres_cur = pg_conn.cursor()
             state = self.redis_storage.retrieve_state(state_name)
             state = state if state else config('DEFAULT_UPDATED_AT_STATE')
-            if state_name != self.redis_storage.states[0]:
+            if state_name != 'filmwork':
                 postgres_cur.execute(self.filmwork_adapter.get_updated_table_sql(state, state_name))
             else:
                 postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_sql(state))
             data = postgres_cur.fetchall()
             updated_state_value = None
-            updated_related_filmworks = None
+            updated_related_filmworks = []
             if data:
                 updated_state_value = data[-1]['updated_at']
-                if state_name != self.redis_storage.states[0]:
+                if state_name != 'filmwork':
                     ids = ','.join([f"'{row['id']}'" for row in data])
                     postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_ids_by_state_name(ids, state_name))
                     updated_filmworks_ids_data = postgres_cur.fetchall()
-                    updated_filmworkds_ids = ','.join([f"'{filmwork['id']}'" for filmwork in updated_filmworks_ids_data])
-                    postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_by_ids_sql(updated_filmworkds_ids))
-                    updated_related_filmworks = postgres_cur.fetchall()
+                    if updated_filmworks_ids_data:
+                        updated_filmworkds_ids = ','.join([f"'{filmwork['id']}'" for filmwork in updated_filmworks_ids_data])
+                        postgres_cur.execute(self.filmwork_adapter.get_updated_filmworks_by_ids_sql(updated_filmworkds_ids))
+                        updated_related_filmworks = postgres_cur.fetchall()
         finally:
             pg_conn.close()
         updated_filmworks = self.UpdatedFilmworks(updated_table_data=data,
@@ -105,9 +106,9 @@ class ETL:
     def extract(self, target):
         while True:
             sleep(5)
-            updated_filmworks = [self.get_updated_table_data(self.redis_storage.states[2]),
-                                 self.get_updated_table_data(self.redis_storage.states[1]),
-                                 self.get_updated_table_data(self.redis_storage.states[0])]
+            updated_filmworks = [self.get_updated_table_data('person'),
+                                 self.get_updated_table_data('genre'),
+                                 self.get_updated_table_data('filmwork')]
             for updated_table_filmworks in updated_filmworks:
                 if updated_table_filmworks.updated_table_data:
                     target.send(updated_table_filmworks)
@@ -131,17 +132,24 @@ class ETL:
                 {'id': _id, 'name': name}
                 for _id, name in zip(film['genres_ids'].split(','), film['genres_titles'].split(','))
             ]
+            directors = [
+                {'id': _id, 'name': name}
+                for _id, name in zip(film['directors_ids'].split(','), film['directors_names'].split(','))
+            ]
             index_film = {
                 'id': film['id'],
                 'genres': genres,
-                'imdb_rating': float(film['rating']),
+                'rating': float(film['rating']),
+                'type': film['type'],
                 'title': film['title'],
                 'description': film['description'],
-                'directors': film['directors_names'].split(','),
+                'directors_names': film['directors_names'].split(','),
+                'genres_names': film['genres_titles'].split(','),
                 'actors_names': film['actors_names'].split(','),
                 'writers_names': film['writers_names'].split(','),
                 'actors': actors,
-                'writers': writers
+                'writers': writers,
+                'directors': directors
             }
             index_film_data.append(index_film)
         return index_film_data
@@ -174,7 +182,8 @@ class ETL:
                 'id': person['id'],
                 'full_name': person['full_name'],
                 'roles': person['roles'].split(','),
-                'film_ids': unique_film_ids
+                'film_ids': unique_film_ids,
+                'birth_day': person['birth']
             }
             index_person_data.append(index_person)
         return index_person_data
@@ -184,9 +193,9 @@ class ETL:
         while True:
             updated_table_filmwork = (yield)
             updated_related_table = None
-            if updated_table_filmwork.state_name == self.redis_storage.states[0]:
+            if updated_table_filmwork.state_name == 'filmwork':
                 transformed_data = self.transform_filmworks(updated_table_filmwork.updated_table_data)
-            elif updated_table_filmwork.state_name == self.redis_storage.states[1]:
+            elif updated_table_filmwork.state_name == 'genre':
                 transformed_data = self.transform_genres(updated_table_filmwork.updated_table_data)
                 updated_related_table = self.transform_filmworks(updated_table_filmwork.updated_related_filmworks)
             else:
@@ -204,8 +213,9 @@ class ETL:
         while True:
             transformed_filmworks = (yield)
             self.__load_to_es(transformed_filmworks.updated_table_data, transformed_filmworks.state_name)
-            if transformed_filmworks.state_name in [self.redis_storage.states[1], self.redis_storage.states[2]]:
-                self.__load_to_es(transformed_filmworks.updated_related_filmworks, self.redis_storage.states[0])
+            if transformed_filmworks.state_name in ['genre', 'person']:
+                if transformed_filmworks.updated_related_filmworks:
+                    self.__load_to_es(transformed_filmworks.updated_related_filmworks, 'filmwork')
             if transformed_filmworks.updated_table_data:
                 self.redis_storage.save_state(transformed_filmworks.state_name,
                                               str(transformed_filmworks.updated_state_value))
